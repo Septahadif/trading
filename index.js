@@ -368,22 +368,32 @@ class TradingWorker {
   }
 
   async sendTelegramNotification(data, parsedSignal) {
-    const message = `📡 <b>AI Signal: ${parsedSignal.signal.toUpperCase()}</b>
-📈 <b>${this.tradingAI.sanitizeForPrompt(data.symbol)} | ${data.tf}</b>
-📊 Close: ${data.ohlc.close.toFixed(5)}
-🎯 <i>${parsedSignal.explanation}</i>
-⏱️ ${new Date().toLocaleTimeString()}`;
+  // Bersihkan teks dan batasi panjang pesan
+  const cleanText = (text) => {
+    return String(text)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .substring(0, 4000); // Batasi panjang pesan
+  };
 
+  const message = `
+📡 <b>AI Signal: ${cleanText(parsedSignal.signal.toUpperCase())}</b>
+📈 <b>${cleanText(data.symbol)} | ${cleanText(data.tf)}</b>
+💰 Close: <code>${cleanText(data.ohlc.close.toFixed(5))}</code>
+🎯 <i>${cleanText(parsedSignal.explanation)}</i>
+⏱️ ${cleanText(new Date().toLocaleTimeString())}
+  `.trim();
+
+  try {
     await this.telegramService.sendMessage(message);
-  }
-
-  createResponse(status, body) {
-    return new Response(
-      typeof body === 'string' ? body : JSON.stringify(body),
-      {
-        status,
-        headers: { "Content-Type": "application/json" }
-      }
+  } catch (error) {
+    console.error("Gagal mengirim notifikasi Telegram:", error.message);
+    // Fallback: Kirim pesan tanpa formatting jika masih gagal
+    await this.telegramService.sendMessage(
+      `AI Signal: ${parsedSignal.signal.toUpperCase()}\n` +
+      `Symbol: ${data.symbol} | TF: ${data.tf}\n` +
+      `Reason: ${parsedSignal.explanation}`
     );
   }
 }
