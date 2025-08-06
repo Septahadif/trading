@@ -24,16 +24,7 @@ class TradingAI {
     try {
       this.validateInputs(data);
       
-      const {
-        symbol, tf, ohlc, indicators, 
-        adx, atr, volume_ratio, pattern, 
-        session, support, resistance,
-        macd_hist_prev = 0
-      } = data;
-
-      // Calculate all derived values
-      const derived = this.calculateDerivedValues(data, macd_hist_prev);
-      
+      const derived = this.calculateDerivedValues(data, data.macd_hist_prev || 0);
       const userContent = this.buildAIPrompt(data, derived);
       
       const payload = {
@@ -54,12 +45,12 @@ class TradingAI {
           },
           body: JSON.stringify(payload)
         },
-        10000 // 10 second timeout
+        10000
       );
 
       return aiResponse;
     } catch (error) {
-      console.error('AI call failed, using fallback:', error);
+      console.error('AI call failed:', error);
       return JSON.stringify(this.generateFallbackSignal(data.indicators || {}));
     }
   }
@@ -332,69 +323,197 @@ class TradingWorker {
         message: error.message 
       });
     }
+class TelegramService {
+  constructor(botToken, chatId) {
+    if (!botToken || !chatId) {
+      throw new Error("Telegram credentials not provided");
+    }
+    this.botToken = botToken;
+    this.chatId = chatId;
+    this.maxRetries = 3;
+    this.timeout = 8000;
   }
 
-  authenticateRequest(request) {
-    const headerKey = request.headers.get("x-api-key");
-    const expectedKey = globalThis.PRE_SHARED_TOKEN;
-    return headerKey && expectedKey && headerKey === expectedKey;
-  }
+  async sendMessage(text) {
+    const safeText = this.sanitizeText(text);
+    const payload = {
+      chat_id: this.chatId,
+      text: safeText,
+      parse_mode: "HTML",
+      disable_web_page_preview: true
+    };
 
-  async parseRequest(request) {
-    try {
-      const bodyJson = await request.json();
-      
-      // Validate required fields
-      const required = [
-        "symbol", "tf", "ohlc", "indicators", 
-        "adx", "atr", "volume_ratio", "pattern",
-        "session", "support", "resistance"
-      ];
-      
-      for (const field of required) {
-        if (!bodyJson[field]) {
-          return { 
-            error: this.createResponse(400, { error: `Missing ${field}` })
-          };
+    for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
+      try {
+        const response = await this.fetchWithTimeout(
+          `https://api.telegram.org/bot${this.botToken}/sendMessage`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          },
+          this.timeout
+        );
+
+        const result = await response.json();
+        if (!result.ok) {
+          throw new Error(result.description || "Telegram API error");
         }
+        return result;
+      } catch (error) {
+        if (attempt === this.maxRetries) {
+          console.error(`Telegram send failed after ${attempt} attempts:`, error);
+          throw error;
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
       }
-      
-      return { data: bodyJson };
-    } catch (error) {
-      return { 
-        error: this.createResponse(400, { error: "Invalid JSON" })
-      };
     }
   }
 
-  async sendTelegramNotification(data, parsedSignal) {
-  // Bersihkan teks dan batasi panjang pesan
-  const cleanText = (text) => {
+  sanitizeText(text) {
     return String(text)
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
-      .substring(0, 4000); // Batasi panjang pesan
-  };
+      .replace(/"/g, "&quot;")
+      .substring(0, 4000); // Telegram max length
+  }
 
-  const message = `
-📡 <b>AI Signal: ${cleanText(parsedSignal.signal.toUpperCase())}</b>
-📈 <b>${cleanText(data.symbol)} | ${cleanText(data.tf)}</b>
-💰 Close: <code>${cleanText(data.ohlc.close.toFixed(5))}</code>
-🎯 <i>${cleanText(parsedSignal.explanation)}</i>
-⏱️ ${cleanText(new Date().toLocaleTimeString())}
-  `.trim();
+  async fetchWithTimeout(url, options, timeout) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
 
-  try {
+    try {
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
+      return response;
+    } catch (error) {
+      clearTimeout(timeoutId);
+      throw error;
+    }
+  }
+}
+
+class TradingWorker {
+  constructor() {
+    if (!globalThis.TELEGRAM_BOT_TOKEN || !globalThis.TELEGRAM_CHAT_ID) {
+      console.warn("Telegram credentials not set - notifications disabled");
+    }
+    
+    this.tradingAI = new TradingAI();
+    this.telegramService = globalThis.TELEGRAM_BOT_TOKEN && globalThis.TELEGRAM_CHAT_ID
+      ? new TelegramService(globalThis.TELEGRAM_BOT_TOKEN, globalThis.TELEGRAM_CHAT_ID)
+      : null;
+    this.rateLimits = new Map();
+  }
+
+  async handle(request) {
+    // Rate limiting (5 requests/minute per IP)
+    const clientIP = request.headers.get('cf-connecting-ip') || 'global';
+    const now = Date.now();
+    const window = 60000; // 1 minute
+    
+    if (!this.rateLimits.has(clientIP)) {
+      this.rateLimits.set(clientIP, []);
+    }
+    
+    const timestamps = this.rateLimits.get(clientIP);
+    while (timestamps.length && timestamps[0] <= now - window) {
+      timestamps.shift();
+    }
+    
+    if (timestamps.length >= 5) {
+      return this.createResponse(429, { error: "Too many requests" });
+    }
+    timestamps.push(now);
+
+    // Method check
+    if (request.method !== "POST") {
+      return this.createResponse(405, { error: "Method Not Allowed" });
+    }
+
+    // Authentication
+    if (!this.authenticateRequest(request)) {
+      return this.createResponse(401, { error: "Unauthorized" });
+    }
+
+    try {
+      const data = await this.parseRequest(request);
+      const aiText = await this.tradingAI.callAI(data, globalThis.FREEV36_API_KEY);
+      const parsed = this.tradingAI.tryParseAI(aiText);
+
+      if (this.telegramService) {
+        await this.sendTelegramNotification(data, parsed).catch(error => {
+          console.error("Telegram notification failed:", error);
+        });
+      }
+
+      return this.createResponse(200, parsed);
+    } catch (error) {
+      console.error("Processing error:", error);
+      return this.createResponse(500, { 
+        error: "Processing failed",
+        details: error.message 
+      });
+    }
+  }
+
+  async sendTelegramNotification(data, parsedSignal) {
+    if (!this.telegramService) return;
+
+    const message = `
+<b>🚀 ${parsedSignal.signal.toUpperCase()} SIGNAL</b>
+<b>${this.escapeHtml(data.symbol)} | ${data.tf}</b>
+📊 Price: <code>${data.ohlc.close.toFixed(5)}</code>
+📈 Trend: ${this.escapeHtml(parsedSignal.explanation)}
+⏰ ${new Date().toUTCString()}
+    `.trim();
+
     await this.telegramService.sendMessage(message);
-  } catch (error) {
-    console.error("Gagal mengirim notifikasi Telegram:", error.message);
-    // Fallback: Kirim pesan tanpa formatting jika masih gagal
-    await this.telegramService.sendMessage(
-      `AI Signal: ${parsedSignal.signal.toUpperCase()}\n` +
-      `Symbol: ${data.symbol} | TF: ${data.tf}\n` +
-      `Reason: ${parsedSignal.explanation}`
-    );
+  }
+
+  escapeHtml(text) {
+    return String(text)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  async parseRequest(request) {
+    try {
+      const data = await request.json();
+      
+      // Validate required fields
+      const requiredFields = [
+        'symbol', 'tf', 'ohlc', 'indicators',
+        'adx', 'atr', 'volume_ratio', 'pattern',
+        'session', 'support', 'resistance'
+      ];
+      
+      const missingFields = requiredFields.filter(field => !data[field]);
+      if (missingFields.length) {
+        throw new Error(`Missing fields: ${missingFields.join(', ')}`);
+      }
+      
+      return data;
+    } catch (error) {
+      throw new Error(`Invalid request: ${error.message}`);
+    }
+  }
+
+  authenticateRequest(request) {
+    const headerKey = request.headers.get("x-api-key");
+    return headerKey && globalThis.PRE_SHARED_TOKEN && headerKey === globalThis.PRE_SHARED_TOKEN;
+  }
+
+  createResponse(status, body) {
+    return new Response(JSON.stringify(body), {
+      status,
+      headers: { "Content-Type": "application/json" }
+    });
   }
 }
 
