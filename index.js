@@ -1,5 +1,5 @@
 const AI_PROXY_ENDPOINT = "https://free.v36.cm/v1/chat/completions";
-const MODEL = "gpt-3.5-turbo-0125";
+const MODEL = "gpt-3.5-turbo";
 
 // Improved configuration - use environment variables
 const TELEGRAM_BOT_TOKEN = globalThis.TELEGRAM_BOT_TOKEN;
