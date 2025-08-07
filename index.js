@@ -2,8 +2,8 @@ const AI_PROXY_ENDPOINT = "https://free.v36.cm/v1/chat/completions";
 const MODEL = "gpt-4o-mini";
 
 // Improved configuration - use environment variables
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || globalThis.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || globalThis.TELEGRAM_CHAT_ID;
+const TELEGRAM_BOT_TOKEN = globalThis.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = globalThis.TELEGRAM_CHAT_ID;
 
 // Cache for analysis results
 const analysisCache = new Map();
